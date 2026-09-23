@@ -4,3 +4,4 @@ requests>=2.31
 beautifulsoup4>=4.12
 pyarrow>=14
 altair>=5
+pypdf>=4.0

@@ -142,23 +142,43 @@ with st.sidebar:
     st.header("Data")
     year = st.selectbox("Election segment", [2026, 2025, 2024, 2023, 2022], index=0)
     with_party = st.toggle("Include party & incumbency", value=True,
-                           help="Doubles the number of requests (~30s instead of ~15s).")
+                           help="One extra request per race for party and incumbency.")
+    fast = st.toggle(
+        "Fast refresh (may lag)", value=False,
+        help="Uses only the Board's summary tables. Much quicker, but those tables run "
+             "behind the actual filings for some candidates, so recent reports can be missed.",
+    )
     refresh = st.button("🔄 Update table", type="primary", width="stretch")
+    st.caption("Fast mode: ~30s, figures may be behind the latest filings." if fast else
+               "Full read: ~3 min cold, ~1.5 min once reports are cached.")
 
 if refresh:
-    bar = st.progress(0.0, text="Starting…")
+    # Two phases with very different costs, so give each its own bar.
+    roster_bar = st.progress(0.0, text="Finding candidates…")
+    report_bar = None if fast else st.progress(0.0, text="Waiting for the candidate list…")
 
-    def report(done: int, total: int, label: str) -> None:
-        bar.progress(done / total, text=f"{done}/{total} races — {label}")
+    def on_roster(done: int, total: int, label: str) -> None:
+        roster_bar.progress(done / total, text=f"Races {done}/{total} — {label}")
+
+    def on_report(done: int, total: int, label: str) -> None:
+        report_bar.progress(done / total, text=f"Reading report {done}/{total} — {label}")
 
     with st.spinner("Pulling from cfb.mn.gov…"):
-        fresh = cfb.scrape_all(year=year, with_party=with_party, progress=report)
-    bar.empty()
+        fresh = cfb.scrape_all(
+            year=year, with_party=with_party, progress=on_roster,
+            read_reports=not fast, report_progress=None if fast else on_report,
+        )
+    roster_bar.empty()
+    if report_bar is not None:
+        report_bar.empty()
+
     if fresh.empty:
         st.error("No data came back. The CFB site may be down or have changed shape.")
     else:
         save_snapshot(fresh, year)
-        st.success(f"Pulled {len(fresh):,} candidates across {fresh['Office'].nunique()} races.")
+        read = int((fresh["Source"] == "Report PDF").sum()) if "Source" in fresh else 0
+        detail = f" — {read:,} read straight from the filed report." if read else ""
+        st.success(f"Pulled {len(fresh):,} candidates across {fresh['Office'].nunique()} races.{detail}")
 
 df, meta = load_snapshot(year)
 
@@ -178,6 +198,28 @@ if scraped_at:
 if meta.get("errors"):
     with st.expander(f"⚠️ {len(meta['errors'])} race(s) failed to load"):
         st.write(meta["errors"])
+
+# Be explicit about where the numbers came from: the Board's summary tables lag behind
+# the filings for some candidates, so a summary-sourced row is a caveat, not a detail.
+if "Source" in df:
+    counts = df["Source"].value_counts()
+    lagging = int(counts.get("CFB summary (may lag)", 0))
+    if lagging:
+        st.warning(
+            f"This snapshot was taken in **fast mode**, so all {lagging:,} rows come from the "
+            "Board's summary tables, which run behind the actual filings for some candidates. "
+            "Turn off *Fast refresh* and update again for figures read from the reports."
+        )
+    odd = {k: int(v) for k, v in counts.items()
+           if k != "Report PDF" and not k.startswith("No report since")}
+    if odd and not lagging:
+        with st.expander(f"ℹ️ {sum(odd.values()):,} row(s) not read from a filed report"):
+            st.write(odd)
+            st.caption(
+                "Mostly candidates who file on paper: the Board scans those, and a scanned "
+                "page has no machine-readable numbers. Those rows keep the Board's summary "
+                "figures and still link the PDF."
+            )
 
 # --- filters ----------------------------------------------------------------
 
@@ -236,7 +278,7 @@ table_tab, leaders_tab, races_tab = st.tabs(["📋 Table", "🏆 Top fundraisers
 SUMMARY_COLUMNS = [
     "Candidate", "Party", "Office", "District", "On ballot",
     "Ending cash balance", "Total receipts", "Total expenditures", "Unpaid bills and loans",
-    "Report", "Report period through", "Report PDF",
+    "Report", "Filed date", "Report period through", "Report PDF",
 ]
 
 column_config = {
@@ -246,12 +288,20 @@ column_config = {
     "On ballot": st.column_config.CheckboxColumn("Ballot", width="small"),
     "Ending cash balance": st.column_config.NumberColumn(
         "Cash on hand", format="dollar", help="Ending cash balance on the most recent report"),
-    "Total receipts": st.column_config.NumberColumn("Raised", format="dollar"),
+    "Total receipts": st.column_config.NumberColumn(
+        "Raised", format="dollar", help="Total receipts, cash. In-kind is a separate line item."),
     "Total expenditures": st.column_config.NumberColumn("Spent", format="dollar"),
     "Unpaid bills and loans": st.column_config.NumberColumn("Debts", format="dollar"),
-    "Report period through": st.column_config.DateColumn("Through", format="MMM D, YYYY"),
+    "Filed date": st.column_config.DateColumn(
+        "Filed", format="MMM D, YYYY", help="Date the Board received the report"),
+    "Report period through": st.column_config.DateColumn(
+        "Through", format="MMM D, YYYY", help="Last day of the reporting period"),
     "Report PDF": st.column_config.LinkColumn("PDF", display_text="Open ↗", width="small"),
     "Candidate page": st.column_config.LinkColumn("CFB page", display_text="View ↗", width="small"),
+    "Source": st.column_config.TextColumn("Source", width="medium"),
+    "Amendment": st.column_config.NumberColumn("Amd.", format="%d", width="small"),
+    "Total receipts incl. in-kind": st.column_config.NumberColumn(format="dollar"),
+    "Total expenditures incl. in-kind": st.column_config.NumberColumn(format="dollar"),
 }
 for name in DETAIL_COLUMNS:
     column_config[name] = st.column_config.NumberColumn(format="dollar")
@@ -262,7 +312,7 @@ with table_tab:
         sort_by = st.selectbox(
             "Sort by",
             ["Ending cash balance", "Total receipts", "Total expenditures",
-             "Unpaid bills and loans", "District", "Candidate"],
+             "Unpaid bills and loans", "Filed date", "District", "Candidate"],
         )
     with right:
         show_detail = st.toggle("Show all line items", value=False)
@@ -276,7 +326,10 @@ with table_tab:
     else:
         ordered = ordered.sort_values(sort_by, ascending=False, na_position="last")
 
-    columns = SUMMARY_COLUMNS + (DETAIL_COLUMNS if show_detail else []) + ["Candidate page"]
+    extra = DETAIL_COLUMNS + ["Total receipts incl. in-kind", "Total expenditures incl. in-kind",
+                              "Amendment", "Source"]
+    columns = SUMMARY_COLUMNS + (extra if show_detail else []) + ["Candidate page"]
+    columns = [c for c in columns if c in ordered.columns]
     st.dataframe(
         ordered[columns],
         column_config=column_config,
@@ -362,9 +415,12 @@ with races_tab:
 
 st.divider()
 st.caption(
-    "Source: Minnesota Campaign Finance and Public Disclosure Board district / "
-    "constitutional offices viewer. Figures are cumulative for the election segment as of "
-    "each candidate's most recent report. The Board does not publish a *filed* date in this "
-    "viewer, so **Through** is the reporting period end date. PDF links point to the original "
-    "filing; later amendments are on the candidate's CFB page."
+    "Source: Minnesota Campaign Finance and Public Disclosure Board. Each row is read from "
+    "that candidate's most recent filed report — the newest period, newest amendment — so "
+    "**Filed** is the date the Board received it and **Through** is the end of the reporting "
+    "period. Figures are cumulative for the election segment. **Raised** and **Spent** are the "
+    "cash columns, which is what the Board reports and what makes beginning cash + raised − "
+    "spent equal cash on hand; in-kind totals are separate line items under *Show all line "
+    "items*. Candidates who file on paper have scanned reports with no machine-readable "
+    "numbers; those rows fall back to the Board's summary table and say so in **Source**."
 )

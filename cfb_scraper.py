@@ -302,21 +302,28 @@ def scrape_office(office: Office, year: int = DEFAULT_YEAR, with_party: bool = T
 COLUMN_ORDER = [
     "Candidate", "Party", "Office", "Chamber", "District", "On ballot", "Incumbent",
     "Ending cash balance", "Total receipts", "Total expenditures", "Unpaid bills and loans",
-    "Report", "Report period through", "Report PDF",
+    "Report", "Filed date", "Report period through", "Report PDF", "Source", "Amendment",
     "Beginning cash on hand", "Individual contributions", "Lobbyist contributions",
     "Committee / fund contributions", "Party unit contributions", "Public subsidy payments",
     "Other receipts", "Campaign expenditures", "Noncampaign expenditures",
-    "Other expenditures", "Candidate ID", "Candidate page",
+    "Other expenditures", "Total receipts incl. in-kind", "Total expenditures incl. in-kind",
+    "Candidate ID", "Candidate page",
 ]
 
+DATE_COLUMNS = ["Filed date", "Report period through"]
 
-def scrape_all(
+
+def scrape_roster(
     year: int = DEFAULT_YEAR,
     with_party: bool = True,
     offices: list[Office] | None = None,
     progress=None,
-) -> pd.DataFrame:
-    """Pull every race in parallel. ``progress(done, total, label)`` is called per race."""
+) -> tuple[list[dict], list[str]]:
+    """Every candidate in every race, with the Board's summary figures.
+
+    Fast (one or two requests per race), but the summary table lags behind the filings
+    for some candidates -- see ``cfb_reports`` for the authoritative pass.
+    """
     targets = offices if offices is not None else all_offices()
     total = len(targets)
     rows: list[dict] = []
@@ -332,13 +339,16 @@ def scrape_all(
                 errors.append(f"{office.label}: {exc}")
             if progress:
                 progress(done, total, office.label)
+    return rows, errors
 
+
+def to_frame(rows: list[dict], year: int, errors: list[str]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-
     df = df.reindex(columns=COLUMN_ORDER)
-    df["Report period through"] = pd.to_datetime(df["Report period through"], errors="coerce")
+    for column in DATE_COLUMNS:
+        df[column] = pd.to_datetime(df[column], errors="coerce")
     # attrs ride along into Parquet, so keep them JSON-serializable.
     df.attrs["scraped_at"] = dt.datetime.now().isoformat(timespec="seconds")
     df.attrs["year"] = year
@@ -346,10 +356,45 @@ def scrape_all(
     return df.sort_values(["Chamber", "District", "Candidate"], kind="stable").reset_index(drop=True)
 
 
+def scrape_all(
+    year: int = DEFAULT_YEAR,
+    with_party: bool = True,
+    offices: list[Office] | None = None,
+    progress=None,
+    read_reports: bool = True,
+    report_progress=None,
+) -> pd.DataFrame:
+    """Pull every race.
+
+    With ``read_reports`` (the default), each candidate's most recent filing is then read
+    from its PDF, which corrects the Board summary's lag and supplies the filing date.
+    Set it False for a quick approximate refresh.
+    """
+    rows, errors = scrape_roster(year, with_party, offices, progress)
+    if not rows or not read_reports:
+        if rows and not read_reports:
+            for row in rows:
+                row["Source"] = "CFB summary (may lag)"
+        return to_frame(rows, year, errors)
+
+    import cfb_reports  # imported lazily so a summary-only refresh needs no pypdf
+
+    cache = cfb_reports.load_cache()
+    rows, report_errors = cfb_reports.enrich(rows, year, cache, report_progress, MAX_WORKERS)
+    cfb_reports.save_cache(cache)
+    return to_frame(rows, year, errors + report_errors)
+
+
 if __name__ == "__main__":
     import sys
 
     sample = [o for o in all_offices() if o.code in {"GC", "AG"} or o.district in {"1A", "1"}]
-    frame = scrape_all(offices=sample, progress=lambda d, t, l: print(f"{d}/{t} {l}", file=sys.stderr))
-    print(frame.head(20).to_string())
+    frame = scrape_all(
+        offices=sample,
+        progress=lambda d, t, l: print(f"roster {d}/{t} {l}", file=sys.stderr),
+        report_progress=lambda d, t, l: print(f"reports {d}/{t} {l}", file=sys.stderr),
+    )
+    columns = ["Candidate", "Office", "Report", "Filed date", "Total receipts",
+               "Ending cash balance", "Source"]
+    print(frame[columns].head(25).to_string())
     print(f"\n{len(frame)} candidates; errors: {frame.attrs.get('errors')}")
